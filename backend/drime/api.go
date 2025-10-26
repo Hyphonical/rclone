@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -208,9 +209,21 @@ func (c *apiClient) getEntry(ctx context.Context, id int64) (*FileEntry, error) 
 
 // download downloads a file - must follow redirect
 func (c *apiClient) download(ctx context.Context, entry *FileEntry, options []fs.OpenOption) (io.ReadCloser, error) {
+	// Check if URL is absolute or relative
+	downloadURL := entry.URL
+	if !strings.HasPrefix(downloadURL, "http://") && !strings.HasPrefix(downloadURL, "https://") {
+		// Relative URL - construct full URL
+		downloadURL = "https://app.drime.cloud" + downloadURL
+		if !strings.HasPrefix(downloadURL, "https://app.drime.cloud/") {
+			downloadURL = "https://app.drime.cloud/" + strings.TrimPrefix(downloadURL, "/")
+		}
+	}
+
+	fs.Debugf(c.f, "Downloading from URL: %s", downloadURL)
+
 	opts := rest.Opts{
 		Method:  "GET",
-		RootURL: entry.URL, // Use the entry's URL directly
+		RootURL: downloadURL,
 		Options: options,
 	}
 
@@ -236,6 +249,8 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 		ParentID: parentID,
 	}
 
+	fs.Debugf(c.f, "Creating folder: name=%s, parentID=%d", name, parentID)
+
 	opts := rest.Opts{
 		Method: "POST",
 		Path:   "/folders",
@@ -247,12 +262,23 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 
 	err = c.f.pacer.Call(func() (bool, error) {
 		httpResp, err = c.srv.CallJSON(ctx, &opts, &req, &resp)
+
+		// Debug: Log response
+		if httpResp != nil {
+			fs.Debugf(c.f, "Create folder response - Status: %d, URL: %s", httpResp.StatusCode, httpResp.Request.URL)
+		}
+		if err != nil {
+			fs.Debugf(c.f, "Create folder error: %v", err)
+		}
+
 		return shouldRetry(ctx, httpResp, err)
 	})
 
 	if err != nil {
 		return nil, fmt.Errorf("create folder failed: %w", err)
 	}
+
+	fs.Debugf(c.f, "Folder created successfully: %+v", resp.Folder)
 
 	return &resp.Folder, nil
 }
