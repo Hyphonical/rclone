@@ -298,8 +298,21 @@ func (c *apiClient) deleteEntries(ctx context.Context, ids []int64, permanent bo
 		DeleteForever: permanent,
 	}
 
+	fs.Debugf(c.f, "Deleting entries: ids=%v, permanent=%v", ids, permanent)
+
+	// Try POST with _method override (Laravel pattern)
+	type DeleteRequestWithMethod struct {
+		DeleteRequest
+		Method string `json:"_method"`
+	}
+
+	reqWithMethod := DeleteRequestWithMethod{
+		DeleteRequest: req,
+		Method:        "DELETE",
+	}
+
 	opts := rest.Opts{
-		Method: "DELETE",
+		Method: "POST",
 		Path:   "/file-entries",
 	}
 
@@ -307,13 +320,23 @@ func (c *apiClient) deleteEntries(ctx context.Context, ids []int64, permanent bo
 	var err error
 
 	err = c.f.pacer.Call(func() (bool, error) {
-		httpResp, err = c.srv.CallJSON(ctx, &opts, &req, nil)
+		httpResp, err = c.srv.CallJSON(ctx, &opts, &reqWithMethod, nil)
+
+		if httpResp != nil {
+			fs.Debugf(c.f, "Delete response - Status: %d, URL: %s", httpResp.StatusCode, httpResp.Request.URL)
+		}
+		if err != nil {
+			fs.Debugf(c.f, "Delete error: %v", err)
+		}
+
 		return shouldRetry(ctx, httpResp, err)
 	})
 
 	if err != nil {
 		return fmt.Errorf("delete failed: %w", err)
 	}
+
+	fs.Debugf(c.f, "Delete successful")
 
 	return nil
 }
