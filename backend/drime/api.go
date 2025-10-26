@@ -115,7 +115,6 @@ func (c *apiClient) login(ctx context.Context, email, password string) (token st
 	opts := rest.Opts{
 		Method: "POST",
 		Path:   "/auth/login",
-		// NoAuth: true, // Don't send auth header for login
 	}
 
 	var resp LoginResponse
@@ -139,20 +138,20 @@ func (c *apiClient) login(ctx context.Context, email, password string) (token st
 
 // listEntries lists files in a directory with pagination
 func (c *apiClient) listEntries(ctx context.Context, parentID *int64) (entries []FileEntry, err error) {
-	page := 1
 	allEntries := []FileEntry{}
 
-	for {
+	for page := 1; ; page++ {
 		opts := rest.Opts{
 			Method: "GET",
 			Path:   "/drive/file-entries",
+			Parameters: map[string][]string{
+				"page": {fmt.Sprintf("%d", page)},
+			},
 		}
 
-		// Add parent filter
+		// Add parent filter if specified
 		if parentID != nil {
-			opts.Parameters = map[string][]string{
-				"parentIds": {fmt.Sprintf("%d", *parentID)},
-			}
+			opts.Parameters["parentIds"] = []string{fmt.Sprintf("%d", *parentID)}
 		}
 
 		var resp ListEntriesResponse
@@ -160,6 +159,12 @@ func (c *apiClient) listEntries(ctx context.Context, parentID *int64) (entries [
 
 		err = c.f.pacer.Call(func() (bool, error) {
 			httpResp, err = c.srv.CallJSON(ctx, &opts, nil, &resp)
+
+			// Debug: Log response for troubleshooting
+			if err != nil && httpResp != nil {
+				fs.Debugf(c.f, "List API error - Status: %d, URL: %s", httpResp.StatusCode, httpResp.Request.URL)
+			}
+
 			return shouldRetry(ctx, httpResp, err)
 		})
 
@@ -173,7 +178,6 @@ func (c *apiClient) listEntries(ctx context.Context, parentID *int64) (entries [
 		if resp.CurrentPage >= resp.LastPage {
 			break
 		}
-		page++
 	}
 
 	return allEntries, nil
