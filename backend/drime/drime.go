@@ -4,6 +4,7 @@ package drime
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"strings"
@@ -11,12 +12,11 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
-	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/lib/pacer"
 )
 
@@ -114,13 +114,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	root = strings.Trim(root, "/")
 
 	f := &Fs{
-		name:        name,
-		root:        root,
-		opt:         *opt,
-		client:      &http.Client{},
-		pathCache:   make(map[string]int64),
-		entryCache:  make(map[int64]*FileEntry),
-		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:       name,
+		root:       root,
+		opt:        *opt,
+		client:     fshttp.NewClient(ctx), // Use rclone's HTTP client
+		pathCache:  make(map[string]int64),
+		entryCache: make(map[int64]*FileEntry),
+		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 
 	f.features = (&fs.Features{
@@ -332,7 +332,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, entry *FileEn
 }
 
 // Put uploads a new object
-func (f *Fs) Put(ctx context.Context, in fs.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: src.Remote(),

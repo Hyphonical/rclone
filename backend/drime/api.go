@@ -2,7 +2,6 @@ package drime
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -110,17 +109,20 @@ func (c *apiClient) login(ctx context.Context, email, password string) (token st
 		Password: password,
 	}
 
+	// Create a temporary client without auth header for login
+	loginClient := rest.NewClient(c.f.client).SetRoot(apiBaseURL)
+
 	opts := rest.Opts{
 		Method: "POST",
 		Path:   "/auth/login",
-		NoAuth: true, // Don't send auth header for login
+		// NoAuth: true, // Don't send auth header for login
 	}
 
 	var resp LoginResponse
 	var httpResp *http.Response
 
 	err = c.f.pacer.Call(func() (bool, error) {
-		httpResp, err = c.srv.CallJSON(ctx, &opts, &req, &resp)
+		httpResp, err = loginClient.CallJSON(ctx, &opts, &req, &resp)
 		return shouldRetry(ctx, httpResp, err)
 	})
 
