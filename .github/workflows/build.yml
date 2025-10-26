@@ -169,6 +169,17 @@ jobs:
         run: |
           rclone version
 
+      - name: Upload build artifacts to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-${{ matrix.job_name }}
+          path: |
+            rclone
+            rclone.exe
+          retention-days: 7
+          if-no-files-found: ignore
+        if: matrix.deploy
+
       - name: Run tests
         run: |
           make quicktest
