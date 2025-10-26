@@ -17,10 +17,10 @@ func uploadFile(ctx context.Context, f *Fs, in io.Reader, name string, parentID 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
-	// Add parentId field
-	err := writer.WriteField("parentId", fmt.Sprintf("%d", parentID))
+	// Add parent_id field (snake_case!)
+	err := writer.WriteField("parent_id", fmt.Sprintf("%d", parentID))
 	if err != nil {
-		return nil, fmt.Errorf("failed to write parentId field: %w", err)
+		return nil, fmt.Errorf("failed to write parent_id field: %w", err)
 	}
 
 	// Add file field

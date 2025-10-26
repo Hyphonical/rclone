@@ -60,7 +60,7 @@ type ListEntriesResponse struct {
 // CreateFolderRequest for making directories
 type CreateFolderRequest struct {
 	Name     string `json:"name"`
-	ParentID int64  `json:"parentId"`
+	ParentID int64  `json:"parent_id"`
 }
 
 // CreateFolderResponse returned after creating folder
@@ -209,13 +209,21 @@ func (c *apiClient) getEntry(ctx context.Context, id int64) (*FileEntry, error) 
 
 // download downloads a file - must follow redirect
 func (c *apiClient) download(ctx context.Context, entry *FileEntry, options []fs.OpenOption) (io.ReadCloser, error) {
-	// Check if URL is absolute or relative
 	downloadURL := entry.URL
+
+	// Check if URL is absolute or relative
 	if !strings.HasPrefix(downloadURL, "http://") && !strings.HasPrefix(downloadURL, "https://") {
-		// Relative URL - construct full URL
-		downloadURL = "https://app.drime.cloud" + downloadURL
-		if !strings.HasPrefix(downloadURL, "https://app.drime.cloud/") {
-			downloadURL = "https://app.drime.cloud/" + strings.TrimPrefix(downloadURL, "/")
+		// Relative URL - need to construct full URL
+		// Remove leading slash if present
+		downloadURL = strings.TrimPrefix(downloadURL, "/")
+
+		// Construct full URL
+		if strings.HasPrefix(downloadURL, "api/") {
+			// URL like "api/v1/file-entries/123" -> https://app.drime.cloud/api/v1/file-entries/123
+			downloadURL = "https://app.drime.cloud/" + downloadURL
+		} else {
+			// Other relative URLs
+			downloadURL = apiBaseURL + "/" + downloadURL
 		}
 	}
 
