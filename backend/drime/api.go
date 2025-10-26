@@ -300,27 +300,17 @@ func (c *apiClient) deleteEntries(ctx context.Context, ids []int64, permanent bo
 
 	fs.Debugf(c.f, "Deleting entries: ids=%v, permanent=%v", ids, permanent)
 
-	// Try POST with _method override (Laravel pattern)
-	type DeleteRequestWithMethod struct {
-		DeleteRequest
-		Method string `json:"_method"`
-	}
-
-	reqWithMethod := DeleteRequestWithMethod{
-		DeleteRequest: req,
-		Method:        "DELETE",
-	}
-
+	// Use POST to /file-entries/delete (not DELETE /file-entries!)
 	opts := rest.Opts{
 		Method: "POST",
-		Path:   "/file-entries",
+		Path:   "/file-entries/delete",
 	}
 
 	var httpResp *http.Response
 	var err error
 
 	err = c.f.pacer.Call(func() (bool, error) {
-		httpResp, err = c.srv.CallJSON(ctx, &opts, &reqWithMethod, nil)
+		httpResp, err = c.srv.CallJSON(ctx, &opts, &req, nil)
 
 		if httpResp != nil {
 			fs.Debugf(c.f, "Delete response - Status: %d, URL: %s", httpResp.StatusCode, httpResp.Request.URL)
