@@ -437,7 +437,7 @@ func (c *apiClient) moveEntries(ctx context.Context, ids []int64, destinationID 
 }
 
 // uploadFile uploads a file using multipart/form-data
-func (c *apiClient) uploadFile(ctx context.Context, in io.Reader, name string, parentID int64, size int64) (*FileEntry, error) {
+func (c *apiClient) uploadFile(ctx context.Context, in io.Reader, name string, parentID int64, size int64, remote string) (*FileEntry, error) {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
@@ -445,6 +445,12 @@ func (c *apiClient) uploadFile(ctx context.Context, in io.Reader, name string, p
 		if err := writer.WriteField("parentId", fmt.Sprintf("%d", parentID)); err != nil {
 			return nil, fmt.Errorf("failed to write parentId field: %w", err)
 		}
+	}
+
+	// The API requires relativePath to place the file correctly.
+	// It should be the full path of the object being created.
+	if err := writer.WriteField("relativePath", remote); err != nil {
+		return nil, fmt.Errorf("failed to write relativePath field: %w", err)
 	}
 
 	part, err := writer.CreateFormFile("file", name)

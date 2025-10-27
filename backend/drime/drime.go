@@ -59,6 +59,7 @@ type Fs struct {
 
 	dirCache   map[string]*FileEntry // path -> entry
 	dirCacheMu sync.RWMutex
+	mkdirCache sync.Map // path -> *sync.Once
 }
 
 // Name of the remote (as passed into NewFs)
@@ -153,7 +154,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if f.root != "" {
 		entry, err := f.findEntry(ctx, f.root)
 		if err == nil && entry.Type != "folder" {
-			// Root is a file
+			// Root is a file, adjust root to parent and return ErrorIsFile
 			newRoot := path.Dir(f.root)
 			if newRoot == "." {
 				newRoot = ""
@@ -166,69 +167,85 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	return f, nil
 }
 
+// addDirCacheEntry adds a directory entry to the cache
+func (f *Fs) addDirCacheEntry(absPath string, entry *FileEntry) {
+    if entry.Type != "folder" {
+        return
+    }
+    f.dirCacheMu.Lock()
+    defer f.dirCacheMu.Unlock()
+    f.dirCache[absPath] = entry
+}
+
 // findEntry finds an entry by path, using cache when possible
 func (f *Fs) findEntry(ctx context.Context, remotePath string) (*FileEntry, error) {
-	// Check cache first
-	f.dirCacheMu.RLock()
-	if entry, ok := f.dirCache[remotePath]; ok {
-		f.dirCacheMu.RUnlock()
-		return entry, nil
-	}
-	f.dirCacheMu.RUnlock()
+    remotePath = strings.Trim(remotePath, "/")
+    if remotePath == "" {
+        // Root directory doesn't have a real entry, but we can represent it
+        return &FileEntry{ID: 0, Type: "folder", Name: ""}, nil
+    }
 
-	// Walk the path
-	parts := strings.Split(strings.Trim(remotePath, "/"), "/")
-	var parentID *int64
+    // Check cache first
+    f.dirCacheMu.RLock()
+    entry, ok := f.dirCache[remotePath]
+    f.dirCacheMu.RUnlock()
+    if ok {
+        return entry, nil
+    }
 
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
+    // Walk the path from the root
+    parts := strings.Split(remotePath, "/")
+    var currentID int64
+    var currentPath string
 
-		// List current directory
-		entries, err := f.api.listEntries(ctx, parentID)
-		if err != nil {
-			return nil, err
-		}
+    for i, part := range parts {
+        currentPath = strings.Join(parts[:i+1], "/")
+        f.dirCacheMu.RLock()
+        cachedEntry, ok := f.dirCache[currentPath]
+        f.dirCacheMu.RUnlock()
 
-		// Find matching entry
-		found := false
-		for i := range entries {
-			if entries[i].Name == part {
-				parentID = &entries[i].ID
-				found = true
-				break
-			}
-		}
+        if ok {
+            currentID = cachedEntry.ID
+            continue
+        }
 
-		if !found {
-			return nil, fs.ErrorObjectNotFound
-		}
-	}
+        parentID := &currentID
+        if i == 0 {
+            parentID = nil // First part is relative to root
+        }
 
-	if parentID == nil {
-		return nil, fs.ErrorObjectNotFound
-	}
+        entries, err := f.api.listEntries(ctx, parentID)
+        if err != nil {
+            return nil, err
+        }
 
-	entries, err := f.api.listEntries(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
+        found := false
+        for i := range entries {
+            e := &entries[i]
+            if e.Name == part {
+                if e.Type == "folder" {
+                    f.addDirCacheEntry(currentPath, e)
+                }
+                if currentPath == remotePath {
+                    return e, nil
+                }
+                currentID = e.ID
+                found = true
+                break
+            }
+        }
 
-	for i := range entries {
-		if entries[i].ID == *parentID {
-			f.dirCacheMu.Lock()
-			f.dirCache[remotePath] = &entries[i]
-			f.dirCacheMu.Unlock()
-			return &entries[i], nil
-		}
-	}
+        if !found {
+            return nil, fs.ErrorObjectNotFound
+        }
+    }
 
-	return nil, fs.ErrorObjectNotFound
+    // This part should ideally not be reached if the path is valid
+    return nil, fs.ErrorObjectNotFound
 }
 
 // List the objects and directories in dir into entries
-func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	dirPath := path.Join(f.root, dir)
 
 	var parentID *int64
@@ -258,9 +275,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 			// Cache folder
 			fullPath := path.Join(f.root, remote)
-			f.dirCacheMu.Lock()
-			f.dirCache[fullPath] = entry
-			f.dirCacheMu.Unlock()
+			f.addDirCacheEntry(fullPath, entry)
 		} else {
 			o := &Object{
 				fs:      f,
@@ -307,36 +322,56 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // Mkdir makes a directory
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	dirPath := path.Join(f.root, dir)
+	if dirPath == "" || dirPath == "." {
+		return nil
+	}
 
+	// Use sync.Once to prevent race conditions on directory creation
+	once, _ := f.mkdirCache.LoadOrStore(dirPath, &sync.Once{})
+	var err error
+	once.(*sync.Once).Do(func() {
+		err = f.mkdir(ctx, dirPath)
+	})
+	return err
+}
+
+// mkdir is the internal implementation for making a directory
+func (f *Fs) mkdir(ctx context.Context, dirPath string) error {
 	// Check if already exists
 	_, err := f.findEntry(ctx, dirPath)
 	if err == nil {
 		return nil // Already exists
 	}
+	if err != fs.ErrorObjectNotFound {
+		return err // Another error occurred
+	}
 
 	// Find parent
 	parentPath := path.Dir(dirPath)
-	var parentID int64 = 0
+	var parentID int64
 
 	if parentPath != "" && parentPath != "." {
-		parentEntry, err := f.findEntry(ctx, parentPath)
-		if err != nil {
-			if err := f.Mkdir(ctx, path.Dir(dir)); err != nil {
-				return err
-			}
-			parentEntry, err = f.findEntry(ctx, parentPath)
-			if err != nil {
-				return err
-			}
+		// Recursively create parent directory
+		if err := f.Mkdir(ctx, strings.TrimPrefix(parentPath, f.root+"/")); err != nil {
+			return err
+		}
+		parentEntry, findErr := f.findEntry(ctx, parentPath)
+		if findErr != nil {
+			return findErr
 		}
 		parentID = parentEntry.ID
 	}
 
 	// Create folder
 	name := path.Base(dirPath)
-	entry, err := f.api.createFolder(ctx, name, parentID)
-	if err != nil {
-		return err
+	entry, createErr := f.api.createFolder(ctx, name, parentID)
+	if createErr != nil {
+		// It might have been created by another goroutine, try to find it again
+		if entry, findErr := f.findEntry(ctx, dirPath); findErr == nil {
+			f.addDirCacheEntry(dirPath, entry)
+			return nil
+		}
+		return createErr
 	}
 
 	// Cache new folder

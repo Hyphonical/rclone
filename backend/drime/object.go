@@ -79,23 +79,25 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // Update updates the object with new content
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	// remotePath is the full path to the file, which is what the API's relativePath expects.
 	remotePath := path.Join(o.fs.root, o.remote)
 	parentPath := path.Dir(remotePath)
 
-	var parentID int64 = 0
+	var parentID int64
 	if parentPath != "" && parentPath != "." {
+		// Mkdir will ensure the parent directory exists, handling concurrency.
 		if err := o.fs.Mkdir(ctx, path.Dir(o.remote)); err != nil {
-			return err
+			return fmt.Errorf("failed to make parent directory: %w", err)
 		}
 
 		parentEntry, err := o.fs.findEntry(ctx, parentPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to find parent entry: %w", err)
 		}
 		parentID = parentEntry.ID
 	}
 
-	entry, err := o.fs.api.uploadFile(ctx, in, path.Base(o.remote), parentID, src.Size())
+	entry, err := o.fs.api.uploadFile(ctx, in, path.Base(o.remote), parentID, src.Size(), remotePath)
 	if err != nil {
 		return err
 	}
