@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -137,48 +138,48 @@ func (c *apiClient) login(ctx context.Context, email, password string) (token st
 	return resp.User.AccessToken, nil
 }
 
-// listEntries lists files in a directory with pagination
-func (c *apiClient) listEntries(ctx context.Context, parentID *int64) (entries []FileEntry, err error) {
-	allEntries := []FileEntry{}
+// listEntries lists files and folders in a directory
+func (c *apiClient) listEntries(ctx context.Context, parentID *int64) ([]FileEntry, error) {
+	var allEntries []FileEntry
+	page := 1
 
-	for page := 1; ; page++ {
+	for {
 		opts := rest.Opts{
 			Method: "GET",
 			Path:   "/drive/file-entries",
-			Parameters: map[string][]string{
-				"page": {fmt.Sprintf("%d", page)},
+			Parameters: url.Values{
+				"page": []string{fmt.Sprintf("%d", page)},
 			},
 		}
 
-		// Add parent filter if specified
 		if parentID != nil {
-			opts.Parameters["parentIds"] = []string{fmt.Sprintf("%d", *parentID)}
+			opts.Parameters.Set("parentId", fmt.Sprintf("%d", *parentID))
 		}
 
-		var resp ListEntriesResponse
+		var resp ListResponse
 		var httpResp *http.Response
+		var err error
 
 		err = c.f.pacer.Call(func() (bool, error) {
 			httpResp, err = c.srv.CallJSON(ctx, &opts, nil, &resp)
-
-			// Debug: Log response for troubleshooting
-			if err != nil && httpResp != nil {
-				fs.Debugf(c.f, "List API error - Status: %d, URL: %s", httpResp.StatusCode, httpResp.Request.URL)
-			}
-
 			return shouldRetry(ctx, httpResp, err)
 		})
 
 		if err != nil {
-			return nil, fmt.Errorf("list failed: %w", err)
+			return nil, err
 		}
 
 		allEntries = append(allEntries, resp.Data...)
 
-		// Check if we need to continue pagination
-		if resp.CurrentPage >= resp.LastPage {
+		fs.Debugf(c.f, "listEntries: page=%d, got=%d entries, total=%d, last_page=%d",
+			page, len(resp.Data), len(allEntries), resp.LastPage)
+
+		// Check if we've reached the last page
+		if page >= resp.LastPage {
 			break
 		}
+
+		page++
 	}
 
 	return allEntries, nil
@@ -265,14 +266,11 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 	if err == nil {
 		fs.Debugf(c.f, "Found %d entries in parent %v", len(entries), checkParentID)
 		for i := range entries {
-			fs.Debugf(c.f, "  - Entry: name=%s, type=%s, id=%d", entries[i].Name, entries[i].Type, entries[i].ID)
 			if entries[i].Name == name && entries[i].Type == "folder" {
 				fs.Debugf(c.f, "Folder already exists: %s (ID: %d)", name, entries[i].ID)
 				return &entries[i], nil
 			}
 		}
-	} else {
-		fs.Debugf(c.f, "Failed to list entries: %v", err)
 	}
 
 	req := CreateFolderRequest{
@@ -308,23 +306,28 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 		return shouldRetry(ctx, httpResp, err)
 	})
 
-	// If we got a 422, try to find the folder again
+	// If we got a 422, try multiple times to find the folder (may need time to appear in listing)
 	if err != nil && httpResp != nil && httpResp.StatusCode == 422 {
-		fs.Debugf(c.f, "Got 422, searching for existing folder: name=%s, parentID=%v", name, checkParentID)
-		entries, listErr := c.listEntries(ctx, checkParentID)
-		if listErr == nil {
-			fs.Debugf(c.f, "Search found %d entries", len(entries))
-			for i := range entries {
-				fs.Debugf(c.f, "  - Checking: name=%s, type=%s, id=%d", entries[i].Name, entries[i].Type, entries[i].ID)
-				if entries[i].Name == name && entries[i].Type == "folder" {
-					fs.Debugf(c.f, "Using existing folder after 422: %s (ID: %d)", name, entries[i].ID)
-					return &entries[i], nil
+		fs.Debugf(c.f, "Got 422, searching for existing folder with retries: name=%s, parentID=%v", name, checkParentID)
+
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Millisecond * 500) // Wait before retry
+			}
+
+			entries, listErr := c.listEntries(ctx, checkParentID)
+			if listErr == nil {
+				fs.Debugf(c.f, "Attempt %d: Found %d entries", attempt+1, len(entries))
+				for i := range entries {
+					if entries[i].Name == name && entries[i].Type == "folder" {
+						fs.Debugf(c.f, "Found existing folder: %s (ID: %d)", name, entries[i].ID)
+						return &entries[i], nil
+					}
 				}
 			}
-			fs.Debugf(c.f, "Folder not found in search results!")
-		} else {
-			fs.Debugf(c.f, "Failed to list entries after 422: %v", listErr)
 		}
+
+		fs.Debugf(c.f, "Failed to find folder after 422 error")
 		return nil, fmt.Errorf("create folder failed: %w", err)
 	}
 
