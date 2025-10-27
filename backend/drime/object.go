@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -54,10 +55,8 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 }
 
 // SetModTime sets the modification time of the object
-func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
-	// Drime doesn't support setting modtime directly
-	// This will cause rclone to re-upload the file
-	return fs.ErrorCantSetModTimeWithoutDelete
+func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
+	return fs.ErrorCantSetModTime
 }
 
 // Storable returns whether this object is storable
@@ -68,6 +67,46 @@ func (o *Object) Storable() bool {
 // ID returns the ID of the object
 func (o *Object) ID() string {
 	return fmt.Sprintf("%d", o.id)
+}
+
+// Open opens the file for read
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	entry, err := o.fs.api.getEntry(ctx, o.id)
+	if err != nil {
+		return nil, err
+	}
+	return o.fs.api.download(ctx, entry, options)
+}
+
+// Update updates the object with new content
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	remotePath := path.Join(o.fs.root, o.remote)
+	parentPath := path.Dir(remotePath)
+
+	var parentID int64 = 0
+	if parentPath != "" && parentPath != "." {
+		if err := o.fs.Mkdir(ctx, path.Dir(o.remote)); err != nil {
+			return err
+		}
+
+		parentEntry, err := o.fs.findEntry(ctx, parentPath)
+		if err != nil {
+			return err
+		}
+		parentID = parentEntry.ID
+	}
+
+	entry, err := o.fs.api.uploadFile(ctx, in, path.Base(o.remote), parentID, src.Size())
+	if err != nil {
+		return err
+	}
+
+	return o.setMetadata(entry)
+}
+
+// Remove removes the object
+func (o *Object) Remove(ctx context.Context) error {
+	return o.fs.api.deleteEntries(ctx, []int64{o.id}, true)
 }
 
 // setMetadata sets the metadata from an API entry
@@ -81,111 +120,30 @@ func (o *Object) setMetadata(entry *FileEntry) error {
 // readMetadata reads the metadata for this object
 func (o *Object) readMetadata(ctx context.Context) error {
 	remotePath := path.Join(o.fs.root, o.remote)
-	entry, err := o.fs.findEntry(ctx, remotePath)
-	if err != nil {
-		return err
-	}
+	dirPath := path.Dir(remotePath)
+	fileName := path.Base(remotePath)
 
-	if entry.Type == "folder" {
-		return fs.ErrorIsDir
-	}
-
-	return o.setMetadata(entry)
-}
-
-// Open opens the file for read
-func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	// Get fresh metadata to ensure we have the latest URL
-	err := o.readMetadata(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get entry from cache
-	o.fs.entryCacheMu.RLock()
-	entry, ok := o.fs.entryCache[o.id]
-	o.fs.entryCacheMu.RUnlock()
-
-	if !ok {
-		return nil, fs.ErrorObjectNotFound
-	}
-
-	return o.fs.api.download(ctx, entry, options)
-}
-
-// Update updates the object with new content
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	remotePath := path.Join(o.fs.root, o.remote)
-
-	// Check if file already exists
-	existingEntry, err := o.fs.findEntry(ctx, remotePath)
-	if err == nil && existingEntry.Type != "folder" {
-		// File exists - delete it first
-		fs.Debugf(o.fs, "File exists, deleting before upload: %s (ID: %d)", remotePath, existingEntry.ID)
-		err = o.fs.api.deleteEntries(ctx, []int64{existingEntry.ID}, true)
+	var parentID *int64
+	if dirPath != "" && dirPath != "." {
+		parentEntry, err := o.fs.findEntry(ctx, dirPath)
 		if err != nil {
-			fs.Debugf(o.fs, "Failed to delete existing file: %v", err)
-			// Continue anyway - maybe upload will overwrite
+			return err
 		}
-
-		// Clear from cache
-		o.fs.pathCacheMu.Lock()
-		delete(o.fs.pathCache, remotePath)
-		o.fs.pathCacheMu.Unlock()
-
-		o.fs.entryCacheMu.Lock()
-		delete(o.fs.entryCache, existingEntry.ID)
-		o.fs.entryCacheMu.Unlock()
+		parentID = &parentEntry.ID
 	}
 
-	// Find parent directory
-	parentPath := path.Dir(remotePath)
-	var parentID int64 = 0
-
-	if parentPath != "" && parentPath != "." && parentPath != "/" {
-		parentEntry, err := o.fs.findEntry(ctx, parentPath)
-		if err != nil {
-			// Try to create parent directory
-			err = o.fs.Mkdir(ctx, path.Dir(o.remote))
-			if err != nil {
-				return err
-			}
-			parentEntry, err = o.fs.findEntry(ctx, parentPath)
-			if err != nil {
-				return err
-			}
-		}
-		parentID = parentEntry.ID
-	}
-
-	// Upload the file
-	entry, err := uploadFile(ctx, o.fs, in, path.Base(remotePath), parentID, src.Size())
+	entries, err := o.fs.api.listEntries(ctx, parentID)
 	if err != nil {
 		return err
 	}
 
-	// Update object metadata
-	return o.setMetadata(entry)
-}
-
-// Remove removes the object
-func (o *Object) Remove(ctx context.Context) error {
-	err := o.fs.api.deleteEntries(ctx, []int64{o.id}, true)
-	if err != nil {
-		return err
+	for i := range entries {
+		if entries[i].Name == fileName && entries[i].Type != "folder" {
+			return o.setMetadata(&entries[i])
+		}
 	}
 
-	// Clear from cache
-	remotePath := path.Join(o.fs.root, o.remote)
-	o.fs.pathCacheMu.Lock()
-	delete(o.fs.pathCache, remotePath)
-	o.fs.pathCacheMu.Unlock()
-
-	o.fs.entryCacheMu.Lock()
-	delete(o.fs.entryCache, o.id)
-	o.fs.entryCacheMu.Unlock()
-
-	return nil
+	return fs.ErrorObjectNotFound
 }
 
 // Check the interfaces are satisfied
