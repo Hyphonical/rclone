@@ -33,18 +33,15 @@ func init() {
 		Description: "Drime cloud storage",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
-			Name: "token",
-			Help: `Access token from Drime account settings.
-Leave blank to use email/password authentication.`,
+			Name:      "token",
+			Help:      "Access token from Drime. Leave blank to use email/password.",
 			Sensitive: true,
 		}, {
 			Name: "email",
-			Help: `Drime account email.
-Only required if token is not provided.`,
+			Help: "Email (only if token not provided).",
 		}, {
 			Name:       "password",
-			Help:       `Drime account password.
-Only required if token is not provided.`,
+			Help:       "Password (only if token not provided).",
 			IsPassword: true,
 		}},
 	})
@@ -60,16 +57,8 @@ type Fs struct {
 	api      *apiClient
 	pacer    *fs.Pacer
 
-	// Path cache: maps path to entry ID
-	pathCache   map[string]int64
-	pathCacheMu sync.RWMutex
-
-	// Entry cache: maps ID to FileEntry
-	entryCache   map[int64]*FileEntry
-	entryCacheMu sync.RWMutex
-
-	// Root ID (null for actual root)
-	rootID *int64
+	dirCache   map[string]*FileEntry // path -> entry
+	dirCacheMu sync.RWMutex
 }
 
 // Name of the remote (as passed into NewFs)
@@ -114,20 +103,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	root = strings.Trim(root, "/")
 
 	f := &Fs{
-		name:       name,
-		root:       root,
-		opt:        *opt,
-		client:     fshttp.NewClient(ctx), // Use rclone's HTTP client
-		pathCache:  make(map[string]int64),
-		entryCache: make(map[int64]*FileEntry),
-		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:     name,
+		root:     root,
+		opt:      *opt,
+		client:   fshttp.NewClient(ctx), // Use rclone's HTTP client
+		dirCache: make(map[string]*FileEntry),
+		pacer:    fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 
 	f.features = (&fs.Features{
 		CaseInsensitive:         false,
 		DuplicateFiles:          false,
-		ReadMimeType:            false,
-		WriteMimeType:           false,
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
 
@@ -183,23 +169,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // findEntry finds an entry by path, using cache when possible
 func (f *Fs) findEntry(ctx context.Context, remotePath string) (*FileEntry, error) {
 	// Check cache first
-	f.pathCacheMu.RLock()
-	if id, ok := f.pathCache[remotePath]; ok {
-		f.pathCacheMu.RUnlock()
-
-		f.entryCacheMu.RLock()
-		if entry, ok := f.entryCache[id]; ok {
-			f.entryCacheMu.RUnlock()
-			return entry, nil
-		}
-		f.entryCacheMu.RUnlock()
-	} else {
-		f.pathCacheMu.RUnlock()
+	f.dirCacheMu.RLock()
+	if entry, ok := f.dirCache[remotePath]; ok {
+		f.dirCacheMu.RUnlock()
+		return entry, nil
 	}
+	f.dirCacheMu.RUnlock()
 
 	// Walk the path
 	parts := strings.Split(strings.Trim(remotePath, "/"), "/")
-	var currentID *int64 = f.rootID
+	var parentID *int64
 
 	for _, part := range parts {
 		if part == "" {
@@ -207,7 +186,7 @@ func (f *Fs) findEntry(ctx context.Context, remotePath string) (*FileEntry, erro
 		}
 
 		// List current directory
-		entries, err := f.api.listEntries(ctx, currentID)
+		entries, err := f.api.listEntries(ctx, parentID)
 		if err != nil {
 			return nil, err
 		}
@@ -216,13 +195,7 @@ func (f *Fs) findEntry(ctx context.Context, remotePath string) (*FileEntry, erro
 		found := false
 		for i := range entries {
 			if entries[i].Name == part {
-				currentID = &entries[i].ID
-
-				// Cache this entry
-				f.entryCacheMu.Lock()
-				f.entryCache[entries[i].ID] = &entries[i]
-				f.entryCacheMu.Unlock()
-
+				parentID = &entries[i].ID
 				found = true
 				break
 			}
@@ -233,25 +206,25 @@ func (f *Fs) findEntry(ctx context.Context, remotePath string) (*FileEntry, erro
 		}
 	}
 
-	if currentID == nil {
+	if parentID == nil {
 		return nil, fs.ErrorObjectNotFound
 	}
 
-	// Get the final entry
-	f.entryCacheMu.RLock()
-	entry, ok := f.entryCache[*currentID]
-	f.entryCacheMu.RUnlock()
-
-	if !ok {
-		return nil, fs.ErrorObjectNotFound
+	entries, err := f.api.listEntries(ctx, nil)
+	if err != nil {
+		return nil, err
 	}
 
-	// Cache the path
-	f.pathCacheMu.Lock()
-	f.pathCache[remotePath] = entry.ID
-	f.pathCacheMu.Unlock()
+	for i := range entries {
+		if entries[i].ID == *parentID {
+			f.dirCacheMu.Lock()
+			f.dirCache[remotePath] = &entries[i]
+			f.dirCacheMu.Unlock()
+			return &entries[i], nil
+		}
+	}
 
-	return entry, nil
+	return nil, fs.ErrorObjectNotFound
 }
 
 // List the objects and directories in dir into entries
@@ -262,17 +235,12 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	if dirPath != "" {
 		entry, err := f.findEntry(ctx, dirPath)
 		if err != nil {
-			if err == fs.ErrorObjectNotFound {
-				return nil, fs.ErrorDirNotFound
-			}
-			return nil, err
+			return nil, fs.ErrorDirNotFound
 		}
 		if entry.Type != "folder" {
 			return nil, fs.ErrorIsFile
 		}
 		parentID = &entry.ID
-	} else {
-		parentID = f.rootID
 	}
 
 	fileEntries, err := f.api.listEntries(ctx, parentID)
@@ -284,19 +252,15 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		entry := &fileEntries[i]
 		remote := path.Join(dir, entry.Name)
 
-		// Cache entry
-		f.entryCacheMu.Lock()
-		f.entryCache[entry.ID] = entry
-		f.entryCacheMu.Unlock()
-
-		fullPath := path.Join(f.root, remote)
-		f.pathCacheMu.Lock()
-		f.pathCache[fullPath] = entry.ID
-		f.pathCacheMu.Unlock()
-
 		if entry.Type == "folder" {
 			d := fs.NewDir(remote, entry.UpdatedAt).SetID(fmt.Sprintf("%d", entry.ID))
 			entries = append(entries, d)
+
+			// Cache folder
+			fullPath := path.Join(f.root, remote)
+			f.dirCacheMu.Lock()
+			f.dirCache[fullPath] = entry
+			f.dirCacheMu.Unlock()
 		} else {
 			o := &Object{
 				fs:      f,
@@ -357,7 +321,13 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	if parentPath != "" && parentPath != "." {
 		parentEntry, err := f.findEntry(ctx, parentPath)
 		if err != nil {
-			return err
+			if err := f.Mkdir(ctx, path.Dir(dir)); err != nil {
+				return err
+			}
+			parentEntry, err = f.findEntry(ctx, parentPath)
+			if err != nil {
+				return err
+			}
 		}
 		parentID = parentEntry.ID
 	}
@@ -370,13 +340,9 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	}
 
 	// Cache new folder
-	f.entryCacheMu.Lock()
-	f.entryCache[entry.ID] = entry
-	f.entryCacheMu.Unlock()
-
-	f.pathCacheMu.Lock()
-	f.pathCache[dirPath] = entry.ID
-	f.pathCacheMu.Unlock()
+	f.dirCacheMu.Lock()
+	f.dirCache[dirPath] = entry
+	f.dirCacheMu.Unlock()
 
 	return nil
 }
@@ -410,13 +376,9 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	// Clear cache
-	f.pathCacheMu.Lock()
-	delete(f.pathCache, dirPath)
-	f.pathCacheMu.Unlock()
-
-	f.entryCacheMu.Lock()
-	delete(f.entryCache, entry.ID)
-	f.entryCacheMu.Unlock()
+	f.dirCacheMu.Lock()
+	delete(f.dirCache, dirPath)
+	f.dirCacheMu.Unlock()
 
 	return nil
 }
@@ -471,7 +433,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	// Rename if needed
 	dstName := path.Base(dstPath)
-	if dstName != srcObj.remote {
+	if dstName != path.Base(srcObj.remote) {
 		_, err = f.api.renameEntry(ctx, srcObj.id, dstName)
 		if err != nil {
 			return nil, err
