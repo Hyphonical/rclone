@@ -117,6 +117,27 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	remotePath := path.Join(o.fs.root, o.remote)
 
+	// Check if file already exists
+	existingEntry, err := o.fs.findEntry(ctx, remotePath)
+	if err == nil && existingEntry.Type != "folder" {
+		// File exists - delete it first
+		fs.Debugf(o.fs, "File exists, deleting before upload: %s (ID: %d)", remotePath, existingEntry.ID)
+		err = o.fs.api.deleteEntries(ctx, []int64{existingEntry.ID}, true)
+		if err != nil {
+			fs.Debugf(o.fs, "Failed to delete existing file: %v", err)
+			// Continue anyway - maybe upload will overwrite
+		}
+
+		// Clear from cache
+		o.fs.pathCacheMu.Lock()
+		delete(o.fs.pathCache, remotePath)
+		o.fs.pathCacheMu.Unlock()
+
+		o.fs.entryCacheMu.Lock()
+		delete(o.fs.entryCache, existingEntry.ID)
+		o.fs.entryCacheMu.Unlock()
+	}
+
 	// Find parent directory
 	parentPath := path.Dir(remotePath)
 	var parentID int64 = 0

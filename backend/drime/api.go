@@ -252,6 +252,17 @@ func (c *apiClient) download(ctx context.Context, entry *FileEntry, options []fs
 
 // createFolder creates a new folder
 func (c *apiClient) createFolder(ctx context.Context, name string, parentID int64) (*FileEntry, error) {
+	// First check if folder already exists
+	entries, err := c.listEntries(ctx, &parentID)
+	if err == nil {
+		for i := range entries {
+			if entries[i].Name == name && entries[i].Type == "folder" {
+				fs.Debugf(c.f, "Folder already exists: %s (ID: %d)", name, entries[i].ID)
+				return &entries[i], nil
+			}
+		}
+	}
+
 	req := CreateFolderRequest{
 		Name:     name,
 		ParentID: parentID,
@@ -266,17 +277,20 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 
 	var resp CreateFolderResponse
 	var httpResp *http.Response
-	var err error
 
 	err = c.f.pacer.Call(func() (bool, error) {
 		httpResp, err = c.srv.CallJSON(ctx, &opts, &req, &resp)
 
-		// Debug: Log response
 		if httpResp != nil {
 			fs.Debugf(c.f, "Create folder response - Status: %d, URL: %s", httpResp.StatusCode, httpResp.Request.URL)
 		}
 		if err != nil {
 			fs.Debugf(c.f, "Create folder error: %v", err)
+		}
+
+		// Don't retry 422 errors (validation errors like "already exists")
+		if httpResp != nil && httpResp.StatusCode == 422 {
+			return false, err
 		}
 
 		return shouldRetry(ctx, httpResp, err)
@@ -404,8 +418,8 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	// Check for specific HTTP status codes
 	if resp != nil {
 		switch resp.StatusCode {
-		case 401, 403, 404:
-			// Don't retry auth failures or not found
+		case 401, 403, 404, 422:
+			// Don't retry auth failures, not found, or validation errors
 			return false, err
 		}
 	}
