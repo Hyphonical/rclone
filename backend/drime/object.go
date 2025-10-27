@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
