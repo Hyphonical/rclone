@@ -156,7 +156,7 @@ func (c *apiClient) listEntries(ctx context.Context, parentID *int64) ([]FileEnt
 			opts.Parameters.Set("parentId", fmt.Sprintf("%d", *parentID))
 		}
 
-		var resp ListResponse
+		var resp ListEntriesResponse
 		var httpResp *http.Response
 		var err error
 
