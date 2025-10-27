@@ -253,7 +253,14 @@ func (c *apiClient) download(ctx context.Context, entry *FileEntry, options []fs
 // createFolder creates a new folder
 func (c *apiClient) createFolder(ctx context.Context, name string, parentID int64) (*FileEntry, error) {
 	// First check if folder already exists
-	entries, err := c.listEntries(ctx, &parentID)
+	var checkParentID *int64
+	if parentID == 0 {
+		checkParentID = nil // Root folder
+	} else {
+		checkParentID = &parentID
+	}
+
+	entries, err := c.listEntries(ctx, checkParentID)
 	if err == nil {
 		for i := range entries {
 			if entries[i].Name == name && entries[i].Type == "folder" {
@@ -286,15 +293,41 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 		}
 		if err != nil {
 			fs.Debugf(c.f, "Create folder error: %v", err)
+
+			// If 422 "already exists", try to find it
+			if httpResp != nil && httpResp.StatusCode == 422 {
+				entries, listErr := c.listEntries(ctx, checkParentID)
+				if listErr == nil {
+					for i := range entries {
+						if entries[i].Name == name && entries[i].Type == "folder" {
+							fs.Debugf(c.f, "Folder exists (found after 422): %s (ID: %d)", name, entries[i].ID)
+							return false, nil // Don't retry, we'll return the found folder
+						}
+					}
+				}
+			}
 		}
 
-		// Don't retry 422 errors (validation errors like "already exists")
+		// Don't retry 422 errors
 		if httpResp != nil && httpResp.StatusCode == 422 {
 			return false, err
 		}
 
 		return shouldRetry(ctx, httpResp, err)
 	})
+
+	// If we got a 422 and found the folder, use it
+	if err != nil && httpResp != nil && httpResp.StatusCode == 422 {
+		entries, listErr := c.listEntries(ctx, checkParentID)
+		if listErr == nil {
+			for i := range entries {
+				if entries[i].Name == name && entries[i].Type == "folder" {
+					fs.Debugf(c.f, "Using existing folder after 422: %s (ID: %d)", name, entries[i].ID)
+					return &entries[i], nil
+				}
+			}
+		}
+	}
 
 	if err != nil {
 		return nil, fmt.Errorf("create folder failed: %w", err)
