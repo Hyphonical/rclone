@@ -1,9 +1,11 @@
 package drime
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -432,6 +434,55 @@ func (c *apiClient) moveEntries(ctx context.Context, ids []int64, destinationID 
 	}
 
 	return nil
+}
+
+// uploadFile uploads a file using multipart/form-data
+func (c *apiClient) uploadFile(ctx context.Context, in io.Reader, name string, parentID int64, size int64) (*FileEntry, error) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	if parentID > 0 {
+		if err := writer.WriteField("parentId", fmt.Sprintf("%d", parentID)); err != nil {
+			return nil, fmt.Errorf("failed to write parentId field: %w", err)
+		}
+	}
+
+	part, err := writer.CreateFormFile("file", name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create form file: %w", err)
+	}
+
+	if _, err := io.Copy(part, in); err != nil {
+		return nil, fmt.Errorf("failed to copy file content: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	opts := rest.Opts{
+		Method:      "POST",
+		Path:        "/uploads",
+		Body:        body,
+		ContentType: writer.FormDataContentType(),
+	}
+
+	var resp struct {
+		Status    string    `json:"status"`
+		FileEntry FileEntry `json:"fileEntry"`
+	}
+	var httpResp *http.Response
+
+	err = c.f.pacer.Call(func() (bool, error) {
+		httpResp, err = c.srv.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, httpResp, err)
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("upload failed: %w", err)
+	}
+
+	return &resp.FileEntry, nil
 }
 
 // shouldRetry determines if an error should be retried
