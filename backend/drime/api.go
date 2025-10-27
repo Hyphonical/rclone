@@ -255,14 +255,17 @@ func (c *apiClient) download(ctx context.Context, entry *FileEntry, options []fs
 
 // createFolder creates a new folder
 func (c *apiClient) createFolder(ctx context.Context, name string, parentID int64) (*FileEntry, error) {
-	// First check if folder already exists
 	var checkParentID *int64
-	if parentID == 0 {
-		checkParentID = nil // Root folder
-	} else {
+	if parentID != 0 {
 		checkParentID = &parentID
 	}
 
+	req := CreateFolderRequest{
+		Name:     name,
+		ParentID: parentID,
+	}
+
+	// First check if folder already exists
 	fs.Debugf(c.f, "Checking if folder exists: name=%s, parentID=%d", name, parentID)
 	entries, err := c.listEntries(ctx, checkParentID)
 	if err == nil {
@@ -273,11 +276,6 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 				return &entries[i], nil
 			}
 		}
-	}
-
-	req := CreateFolderRequest{
-		Name:     name,
-		ParentID: parentID,
 	}
 
 	fs.Debugf(c.f, "Creating folder: name=%s, parentID=%d", name, parentID)
