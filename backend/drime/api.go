@@ -260,14 +260,19 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 		checkParentID = &parentID
 	}
 
+	fs.Debugf(c.f, "Checking if folder exists: name=%s, parentID=%d", name, parentID)
 	entries, err := c.listEntries(ctx, checkParentID)
 	if err == nil {
+		fs.Debugf(c.f, "Found %d entries in parent %v", len(entries), checkParentID)
 		for i := range entries {
+			fs.Debugf(c.f, "  - Entry: name=%s, type=%s, id=%d", entries[i].Name, entries[i].Type, entries[i].ID)
 			if entries[i].Name == name && entries[i].Type == "folder" {
 				fs.Debugf(c.f, "Folder already exists: %s (ID: %d)", name, entries[i].ID)
 				return &entries[i], nil
 			}
 		}
+	} else {
+		fs.Debugf(c.f, "Failed to list entries: %v", err)
 	}
 
 	req := CreateFolderRequest{
@@ -293,19 +298,6 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 		}
 		if err != nil {
 			fs.Debugf(c.f, "Create folder error: %v", err)
-
-			// If 422 "already exists", try to find it
-			if httpResp != nil && httpResp.StatusCode == 422 {
-				entries, listErr := c.listEntries(ctx, checkParentID)
-				if listErr == nil {
-					for i := range entries {
-						if entries[i].Name == name && entries[i].Type == "folder" {
-							fs.Debugf(c.f, "Folder exists (found after 422): %s (ID: %d)", name, entries[i].ID)
-							return false, nil // Don't retry, we'll return the found folder
-						}
-					}
-				}
-			}
 		}
 
 		// Don't retry 422 errors
@@ -316,17 +308,24 @@ func (c *apiClient) createFolder(ctx context.Context, name string, parentID int6
 		return shouldRetry(ctx, httpResp, err)
 	})
 
-	// If we got a 422 and found the folder, use it
+	// If we got a 422, try to find the folder again
 	if err != nil && httpResp != nil && httpResp.StatusCode == 422 {
+		fs.Debugf(c.f, "Got 422, searching for existing folder: name=%s, parentID=%v", name, checkParentID)
 		entries, listErr := c.listEntries(ctx, checkParentID)
 		if listErr == nil {
+			fs.Debugf(c.f, "Search found %d entries", len(entries))
 			for i := range entries {
+				fs.Debugf(c.f, "  - Checking: name=%s, type=%s, id=%d", entries[i].Name, entries[i].Type, entries[i].ID)
 				if entries[i].Name == name && entries[i].Type == "folder" {
 					fs.Debugf(c.f, "Using existing folder after 422: %s (ID: %d)", name, entries[i].ID)
 					return &entries[i], nil
 				}
 			}
+			fs.Debugf(c.f, "Folder not found in search results!")
+		} else {
+			fs.Debugf(c.f, "Failed to list entries after 422: %v", listErr)
 		}
+		return nil, fmt.Errorf("create folder failed: %w", err)
 	}
 
 	if err != nil {
